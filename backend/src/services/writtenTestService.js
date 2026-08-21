@@ -54,6 +54,22 @@ export async function syncCandidateWorkflowStatus(candidateId) {
   return status;
 }
 
+/**
+ * Recalculate written-test percentiles efficiently.
+ *
+ * Important behavior:
+ * - Percentiles are updated as marks arrive.
+ * - Nobody is marked WRITTEN CLEARED/REJECTED until at least the configured
+ *   number of candidates (default 150) have scored marks in the campaign.
+ *   This prevents the dashboard's "Written cleared" count from simply
+ *   following 60 -> 80 -> 115 as marks are entered.
+ * - Once the pool reaches the qualification count, exactly the top N are
+ *   qualified on the current normalized ranking.
+ * - Existing candidates already beyond the written round keep their later
+ *   status; only written-stage candidates are updated.
+ * - Database updates are batched instead of issuing one query per candidate,
+ *   which fixes the "Saving…" spinner on larger batches.
+ */
 export async function recalculateWrittenTests(campaignId = null) {
   const params = [];
   let where = 'w.marks IS NOT NULL AND w.set_number IS NOT NULL AND c.attendance <> \'ABSENT\' AND c.deleted_at IS NULL';
@@ -90,13 +106,6 @@ export async function recalculateWrittenTests(campaignId = null) {
   const sortedZ = scored.map(x => x.normalizedZ).filter(Number.isFinite).sort((a, b) => a - b);
   const normalizedPct = z => midrankPercentile(sortedZ, z);
 
-  for (const row of scored) {
-    await pool.query(
-      'UPDATE written_tests SET set_percentile=?,normalized_z=?,normalized_percentile=?,qualified=NULL WHERE id=?',
-      [row.setPercentile, row.normalizedZ, normalizedPct(row.normalizedZ), row.id]
-    );
-  }
-
   let qualifiedCount = Number(process.env.WRITTEN_QUALIFIED_COUNT || 150);
   if (campaignId) {
     const [[cfg]] = await pool.query('SELECT written_qualified_count FROM campaigns WHERE id=?', [campaignId]);
@@ -106,20 +115,73 @@ export async function recalculateWrittenTests(campaignId = null) {
     qualifiedCount = Number(cfg?.written_qualified_count || qualifiedCount);
   }
 
-  const ranked = [...scored].sort((a, b) => b.normalizedZ - a.normalizedZ || b.setPercentile - a.setPercentile || a.candidate_id - b.candidate_id);
-  const cutoff = ranked.length ? ranked[Math.min(qualifiedCount, ranked.length) - 1].normalizedZ : null;
-
-  for (let index = 0; index < ranked.length; index++) {
-    await pool.query('UPDATE written_tests SET qualified=? WHERE id=?', [index < qualifiedCount, ranked[index].id]);
+  const ranked = [...scored].sort((a, b) =>
+    b.normalizedZ - a.normalizedZ ||
+    b.setPercentile - a.setPercentile ||
+    a.candidate_id - b.candidate_id
+  );
+  const finalized = ranked.length >= qualifiedCount;
+  const qualifiedById = new Map();
+  if (finalized) {
+    for (let index = 0; index < ranked.length; index++) {
+      qualifiedById.set(ranked[index].id, index < qualifiedCount);
+    }
   }
 
-  const affected = new Set(ranked.map(row => row.candidate_id));
-  for (const row of ranked) affected.add(row.candidate_id);
-  for (const id of affected) await syncCandidateWorkflowStatus(id);
+  // Batch written-test updates into a single CASE statement.
+  if (scored.length) {
+    const ids = scored.map(r => r.id);
+    const setPctCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
+    const zCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
+    const normPctCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
+    const qualCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
+    const updateParams = [];
 
+    for (const row of scored) updateParams.push(row.id, row.setPercentile);
+    for (const row of scored) updateParams.push(row.id, row.normalizedZ);
+    for (const row of scored) updateParams.push(row.id, normalizedPct(row.normalizedZ));
+    for (const row of scored) updateParams.push(row.id, finalized ? (qualifiedById.get(row.id) ? 1 : 0) : null);
+
+    updateParams.push(...ids);
+    await pool.query(
+      `UPDATE written_tests
+          SET set_percentile=CASE ${setPctCase} END,
+              normalized_z=CASE ${zCase} END,
+              normalized_percentile=CASE ${normPctCase} END,
+              qualified=CASE ${qualCase} END
+        WHERE id IN (${ids.map(() => '?').join(',')})`,
+      updateParams
+    );
+  }
+
+  // Keep candidate workflow statuses consistent in one database operation.
+  if (scored.length) {
+    const ids = [...new Set(scored.map(r => r.candidate_id))];
+    const candidatePlaceholders = ids.map(() => '?').join(',');
+    await pool.query(
+      `UPDATE candidates c
+          JOIN written_tests w ON w.candidate_id=c.id
+          SET c.status=CASE
+            WHEN c.status IN ('APPLIED FOR WRITTEN','GAVE WRITTEN','WRITTEN CLEARED','WRITTEN REJECTED')
+              THEN CASE
+                WHEN w.qualified=1 THEN 'WRITTEN CLEARED'
+                WHEN w.qualified=0 THEN 'WRITTEN REJECTED'
+                ELSE 'GAVE WRITTEN'
+              END
+            ELSE c.status
+          END
+        WHERE c.id IN (${candidatePlaceholders})
+          AND c.attendance <> 'ABSENT'`,
+      ids
+    );
+  }
+
+  const cutoff = finalized && ranked.length ? ranked[Math.min(qualifiedCount, ranked.length) - 1].normalizedZ : null;
   return {
     scored: ranked.length,
-    qualified: Math.min(qualifiedCount, ranked.length),
+    qualified: finalized ? Math.min(qualifiedCount, ranked.length) : 0,
+    finalized,
+    requiredForFinalization: qualifiedCount,
     cutoffZ: cutoff,
     cutoffPercentile: cutoff == null ? null : normalizedPct(cutoff)
   };
