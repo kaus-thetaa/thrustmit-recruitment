@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import dotenv from 'dotenv';
+import XLSX from 'xlsx';
 import { pool } from './db.js';
 import { requireAuth, requireRole, signToken, getUserById } from './auth.js';
 import { audit } from './audit.js';
@@ -23,15 +24,71 @@ app.get('/api/auth/me',requireAuth,async(req,res)=>{const user=await getUserById
 app.get('/api/campaigns',requireAuth,async(_req,res)=>{const[r]=await pool.query('SELECT * FROM campaigns ORDER BY recruitment_year DESC,id DESC');res.json(r)});
 app.post('/api/campaigns',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const{name,recruitmentYear,writtenMaxMarks=20,writtenQualifiedCount=150}=req.body||{};if(!name||!recruitmentYear)return res.status(400).json({error:'Campaign name and year are required'});await pool.query('UPDATE campaigns SET active=0 WHERE id IS NOT NULL'); const[r]=await pool.query('INSERT INTO campaigns(name,recruitment_year,written_max_marks,written_qualified_count,active) VALUES(?,?,?,?,1)',[name,Number(recruitmentYear),Number(writtenMaxMarks),Number(writtenQualifiedCount)]);const[rows]=await pool.query('SELECT * FROM campaigns WHERE id=?',[r.insertId]);res.status(201).json(rows[0])}catch(e){res.status(500).json({error:e.code==='ER_DUP_ENTRY'?'Campaign already exists':e.message})}});
 
-app.get('/api/candidates',requireAuth,async(req,res)=>{try{const q=String(req.query.q||'').trim(),status=String(req.query.status||'').trim(),includeDeleted=String(req.query.includeDeleted||'')==='true',branch=String(req.query.branch||'').trim();const page=Math.max(1,Number(req.query.page||1)),pageSize=Math.min(100,Math.max(1,Number(req.query.pageSize||25)));const params=[];let where=includeDeleted?'1=1':'deleted_at IS NULL';if(q){where+=' AND (name LIKE ? OR learner_id LIKE ? OR registration_number LIKE ? OR phone LIKE ? OR email LIKE ?)';const s=`%${q}%`;params.push(s,s,s,s,s)}if(status&&status!=='ALL'){where+=' AND status=?';params.push(status)}if(branch){where+=' AND branch=?';params.push(branch)}const[[{count}]]=await pool.query(`SELECT COUNT(*) count FROM candidates WHERE ${where}`,params);const[rows]=await pool.query(`SELECT * FROM candidates WHERE ${where} ORDER BY name LIMIT ? OFFSET ?`,[...params,pageSize,(page-1)*pageSize]);const[branches]=await pool.query('SELECT DISTINCT branch FROM candidates WHERE branch IS NOT NULL AND branch<>\'\' ORDER BY branch');res.json({data:rows,page,pageSize,total:Number(count),branches:branches.map(x=>x.branch),statuses:CANDIDATE_STATUSES})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/candidates',requireAuth,async(req,res)=>{
+  try{
+    const q=String(req.query.q||'').trim();
+    const status=String(req.query.status||'').trim();
+    const includeDeleted=String(req.query.includeDeleted||'')==='true';
+    const branch=String(req.query.branch||'').trim();
+    const writtenAttendance=String(req.query.writtenAttendance||'').trim();
+    const phaseId=Number(req.query.phaseId||0);
+    const page=Math.max(1,Number(req.query.page||1));
+    const pageSize=Math.min(100,Math.max(1,Number(req.query.pageSize||25)));
+    const params=[];
+    let where=includeDeleted?'1=1':'deleted_at IS NULL';
+    if(q){where+=' AND (name LIKE ? OR learner_id LIKE ? OR registration_number LIKE ? OR phone LIKE ? OR email LIKE ? OR branch LIKE ?)';const s=`%${q}%`;params.push(s,s,s,s,s,s)}
+    if(status&&status!=='ALL'){where+=' AND status=?';params.push(status)}
+    if(branch){where+=' AND branch=?';params.push(branch)}
+    if(writtenAttendance==='UNMARKED') where+=" AND attendance='UNKNOWN'";
+    else if(writtenAttendance==='PRESENT'||writtenAttendance==='ABSENT'){where+=' AND attendance=?';params.push(writtenAttendance)}
+    if(phaseId){where+=' AND EXISTS (SELECT 1 FROM interview_results fxr WHERE fxr.candidate_id=candidates.id AND fxr.phase_id=?)';params.push(phaseId)}
+    const [[{count}]]=await pool.query(`SELECT COUNT(*) count FROM candidates WHERE ${where}`,params);
+    const [rows]=await pool.query(`SELECT * FROM candidates WHERE ${where} ORDER BY name LIMIT ? OFFSET ?`,[...params,pageSize,(page-1)*pageSize]);
+    const [branches]=await pool.query("SELECT DISTINCT branch FROM candidates WHERE branch IS NOT NULL AND branch<>'' ORDER BY branch");
+    res.json({data:rows,page,pageSize,total:Number(count),branches:branches.map(x=>x.branch),statuses:CANDIDATE_STATUSES});
+  }catch(e){res.status(500).json({error:e.message})}
+});
 
 app.post('/api/candidates',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const{campaignId,name,learnerId,registrationNumber,email,phone,branch,notes}=req.body||{};if(!name)return res.status(400).json({error:'Name is required'});const[r]=await pool.query('INSERT INTO candidates(campaign_id,name,learner_id,registration_number,email,phone,branch,status,notes) VALUES(?,?,?,?,?,?,?,\'APPLIED FOR WRITTEN\',?)',[campaignId||null,name,learnerId||null,registrationNumber||null,email||null,phone||null,branch||null,notes||null]);await audit({userId:req.user.id,candidateId:r.insertId,action:'CREATE',objectType:'candidate',objectId:r.insertId,newValue:name});const[rows]=await pool.query('SELECT * FROM candidates WHERE id=?',[r.insertId]);res.status(201).json(rows[0])}catch(e){res.status(500).json({error:e.code==='ER_DUP_ENTRY'?'Registration number already exists':e.message})}});
 
 app.get('/api/candidates/:id',requireAuth,async(req,res)=>{try{const[cRows]=await pool.query(`SELECT c.*,ca.name campaign_name,ca.recruitment_year FROM candidates c LEFT JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=?`,[req.params.id]);if(!cRows[0])return res.status(404).json({error:'Candidate not found'});const[w]=await pool.query('SELECT w.*,u.name scored_by_name FROM written_tests w LEFT JOIN users u ON u.id=w.scored_by WHERE w.candidate_id=?',[req.params.id]);const[i]=await pool.query(`SELECT r.*,p.name phase_name,p.phase_type,p.phase_order,cu.name created_by_name FROM interview_results r JOIN interview_phases p ON p.id=r.phase_id LEFT JOIN users cu ON cu.id=r.created_by WHERE r.candidate_id=? ORDER BY p.phase_order,r.created_at`,[req.params.id]);const[a]=await pool.query('SELECT a.*,u.name user_name FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id WHERE candidate_id=? ORDER BY a.created_at DESC LIMIT 200',[req.params.id]);res.json({candidate:cRows[0],written:w[0]||null,interviews:i,audit:a})}catch(e){res.status(500).json({error:e.message})}});
 
 app.put('/api/candidates/:id',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const allowed=['name','learner_id','registration_number','phone','email','branch','status','notes','attendance','campaign_id'];const sets=[],values=[];for(const key of allowed)if(Object.hasOwn(req.body,key)){sets.push(`${key}=?`);values.push(req.body[key]??null)}if(!sets.length)return res.status(400).json({error:'Nothing to update'});const[b]=await pool.query('SELECT * FROM candidates WHERE id=?',[req.params.id]);if(!b[0])return res.status(404).json({error:'Candidate not found'});values.push(req.params.id);await pool.query(`UPDATE candidates SET ${sets.join(', ')} WHERE id=?`,values);for(const key of allowed)if(Object.hasOwn(req.body,key)&&String(b[0][key]??'')!==String(req.body[key]??''))await audit({userId:req.user.id,candidateId:req.params.id,action:'UPDATE',objectType:'candidate',objectId:req.params.id,fieldName:key,oldValue:b[0][key],newValue:req.body[key]});const[r]=await pool.query('SELECT * FROM candidates WHERE id=?',[req.params.id]);res.json(r[0])}catch(e){res.status(500).json({error:e.code==='ER_DUP_ENTRY'?'Registration number already exists':e.message})}});
+app.post('/api/candidates/bulk-archive',requireAuth,requireRole('ADMIN'),async(req,res)=>{
+  try{
+    const ids=Array.isArray(req.body?.ids)?req.body.ids.map(Number).filter(Boolean):[];
+    if(!ids.length)return res.status(400).json({error:'No candidates selected'});
+    const placeholders=ids.map(()=>'?').join(',');
+    const[rows]=await pool.query(`SELECT id,status FROM candidates WHERE deleted_at IS NULL AND id IN (${placeholders})`,ids);
+    if(!rows.length)return res.json({archived:0});
+    await pool.query(`UPDATE candidates SET archived_status=status,deleted_at=NOW() WHERE deleted_at IS NULL AND id IN (${placeholders})`,ids);
+    for(const r of rows)await audit({userId:req.user.id,candidateId:r.id,action:'ARCHIVE',objectType:'candidate',objectId:r.id,oldValue:r.status,newValue:'ARCHIVED'});
+    res.json({archived:rows.length})
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
 app.delete('/api/candidates/:id',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const[[c]]=await pool.query('SELECT id,status FROM candidates WHERE id=?',[req.params.id]);if(!c)return res.status(404).json({error:'Candidate not found'});await pool.query("UPDATE candidates SET archived_status=status,deleted_at=NOW() WHERE id=?",[req.params.id]);await audit({userId:req.user.id,candidateId:req.params.id,action:'ARCHIVE',objectType:'candidate',objectId:req.params.id,oldValue:c.status,newValue:'ARCHIVED'});res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
 app.post('/api/candidates/:id/restore',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const[[c]]=await pool.query('SELECT id,status,archived_status FROM candidates WHERE id=?',[req.params.id]);if(!c)return res.status(404).json({error:'Candidate not found'});const status=c.archived_status||c.status||'APPLIED FOR WRITTEN';await pool.query('UPDATE candidates SET deleted_at=NULL,status=?,archived_status=NULL WHERE id=?',[status,req.params.id]);await audit({userId:req.user.id,candidateId:req.params.id,action:'RESTORE',objectType:'candidate',objectId:req.params.id,oldValue:'ARCHIVED',newValue:status});res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
+
+app.post('/api/written-tests/bulk-mark-absent',requireAuth,requireRole('ADMIN','TEST_CHECKER'),async(req,res)=>{
+  try{
+    const{q='',status='ALL',branch='',phaseId=0}=req.body||{};
+    const params=[];
+    let where="deleted_at IS NULL AND attendance='UNKNOWN'";
+    const term=String(q).trim();
+    if(term){where+=' AND (name LIKE ? OR learner_id LIKE ? OR registration_number LIKE ? OR phone LIKE ? OR email LIKE ? OR branch LIKE ?)';const like=`%${term}%`;params.push(like,like,like,like,like,like)}
+    if(status&&status!=='ALL'){where+=' AND status=?';params.push(status)}
+    if(branch){where+=' AND branch=?';params.push(branch)}
+    if(Number(phaseId)){where+=' AND NOT EXISTS (SELECT 1 FROM interview_results z WHERE z.candidate_id=candidates.id AND z.phase_id=?)';params.push(Number(phaseId))}
+    const[rows]=await pool.query(`SELECT id,status,campaign_id FROM candidates WHERE ${where}`,params);
+    if(!rows.length)return res.json({marked:0});
+    const ids=rows.map(r=>r.id);const placeholders=ids.map(()=>'?').join(',');
+    await pool.query(`UPDATE candidates SET attendance='ABSENT',status=CASE WHEN status IN ('APPLIED FOR WRITTEN','GAVE WRITTEN') THEN 'ABSENT FOR WRITTEN' ELSE status END WHERE id IN (${placeholders})`,ids);
+    for(const r of rows)await audit({userId:req.user.id,candidateId:r.id,action:'MARK_WRITTEN_ABSENT',objectType:'candidate',objectId:r.id,oldValue:'UNKNOWN',newValue:'ABSENT'});
+    for(const cid of [...new Set(rows.map(r=>r.campaign_id).filter(Boolean))])await recalculateWrittenTests(cid);
+    res.json({marked:rows.length})
+  }catch(e){res.status(500).json({error:e.message})}
+});
 
 app.put('/api/written-tests/:candidateId',requireAuth,requireRole('ADMIN','TEST_CHECKER'),async(req,res)=>{
   try{
@@ -78,6 +135,55 @@ app.put('/api/written-tests/:candidateId/attendance',requireAuth,requireRole('AD
 
 app.get('/api/written/summary',requireAuth,async(req,res)=>{try{res.json(await writtenSummary(req.query.campaignId?Number(req.query.campaignId):null))}catch(e){res.status(500).json({error:e.message})}});
 app.get('/api/written/what-if',requireAuth,async(req,res)=>{try{res.json(await cutoffWhatIf(req.query.topN,req.query.campaignId?Number(req.query.campaignId):null))}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/written/export',requireAuth,async(req,res)=>{
+  try{
+    const campaignId=req.query.campaignId?Number(req.query.campaignId):null;
+    const params=[];
+    let scope="c.deleted_at IS NULL AND w.qualified=1 AND c.attendance='PRESENT'";
+    if(campaignId){scope+=' AND c.campaign_id=?';params.push(campaignId)}
+    const [[campaign]]=await pool.query('SELECT id,name,recruitment_year,written_max_marks,written_qualified_count FROM campaigns WHERE id=? OR (id=? AND ? IS NULL) LIMIT 1',[campaignId||0,campaignId||0,campaignId]);
+    const [rows]=await pool.query(`SELECT c.name,c.learner_id,c.registration_number,c.email,c.phone,c.branch,c.attendance,
+      w.set_number,w.marks,w.set_percentile,w.normalized_percentile,w.normalized_z,w.qualified
+      FROM candidates c JOIN written_tests w ON w.candidate_id=c.id
+      WHERE ${scope}
+      ORDER BY w.normalized_percentile DESC,w.normalized_z DESC,c.name ASC`,params);
+    const qualified=rows.map((r,i)=>({...r,rank:i+1}));
+    const cutoff=qualified.length?qualified[qualified.length-1]:null;
+    const [setStats]=await pool.query(`SELECT w.set_number,COUNT(*) total,SUM(w.marks IS NOT NULL) scored,AVG(w.marks) avg_marks,MIN(w.marks) min_marks,MAX(w.marks) max_marks
+      FROM written_tests w JOIN candidates c ON c.id=w.candidate_id WHERE c.deleted_at IS NULL AND c.attendance='PRESENT' ${campaignId?'AND c.campaign_id=?':''} GROUP BY w.set_number ORDER BY w.set_number`,campaignId?[campaignId]:[]);
+    const overview=[
+      ['WRITTEN TEST — QUALIFIED CANDIDATES'],
+      ['Campaign',campaign?.name||'Active recruitment'],
+      ['Recruitment year',campaign?.recruitment_year||new Date().getFullYear()],
+      ['Generated',new Date().toISOString()],
+      ['Qualified candidates',qualified.length],
+      ['Configured cutoff count',Number(campaign?.written_qualified_count||150)],
+      ['Cutoff percentile',cutoff?.normalized_percentile==null?'':Number(cutoff.normalized_percentile)],
+      ['Cutoff raw marks',cutoff?.marks==null?'':Number(cutoff.marks)],
+      ['Cutoff set',cutoff?.set_number==null?'':Number(cutoff.set_number)],
+      ['Note','Cutoff percentile is the lowest normalized percentile among the qualified candidates. Raw marks are shown with the cutoff candidate set.'],
+      [],
+      ['Set','Candidates','Scored','Average marks','Minimum marks','Maximum marks'],
+      ...setStats.map(r=>[Number(r.set_number),Number(r.total),Number(r.scored||0),r.avg_marks==null?'':Number(r.avg_marks),r.min_marks==null?'':Number(r.min_marks),r.max_marks==null?'':Number(r.max_marks)])
+    ];
+    const candidateRows=[['Rank','Name','Learner ID / College Mail','Registration No.','Personal Email','Phone','Branch','Written Attendance','Set','Marks / 20','Set Percentile','Normalized Percentile','Qualified']];
+    for(const r of qualified){candidateRows.push([r.rank,r.name,r.learner_id||'',r.registration_number||'',r.email||'',r.phone||'',r.branch||'',r.attendance||'',Number(r.set_number),r.marks==null?'':Number(r.marks),r.set_percentile==null?'':Number(r.set_percentile),r.normalized_percentile==null?'':Number(r.normalized_percentile),r.qualified?'YES':'NO'])}
+    const wb=XLSX.utils.book_new();
+    const ws1=XLSX.utils.aoa_to_sheet(overview);
+    ws1['!cols']=[{wch:28},{wch:72},{wch:16},{wch:18},{wch:18},{wch:18}];
+    const ws2=XLSX.utils.aoa_to_sheet(candidateRows);
+    ws2['!cols']=[{wch:8},{wch:28},{wch:24},{wch:20},{wch:30},{wch:16},{wch:20},{wch:20},{wch:8},{wch:12},{wch:18},{wch:23},{wch:12}];
+    ws2['!autofilter']={ref:`A1:M${candidateRows.length}`};
+    ws2['!freeze']={xSplit:0,ySplit:1};
+    XLSX.utils.book_append_sheet(wb,ws1,'Written Summary');
+    XLSX.utils.book_append_sheet(wb,ws2,'Qualified Candidates');
+    const out=XLSX.write(wb,{type:'buffer',bookType:'xlsx'});
+    const year=campaign?.recruitment_year||new Date().getFullYear();
+    res.setHeader('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition',`attachment; filename=written-qualified-${year}.xlsx`);
+    res.send(out);
+  }catch(e){res.status(500).json({error:e.message})}
+});
 
 app.get('/api/interview-phases',requireAuth,async(req,res)=>{const campaignId=Number(req.query.campaignId||0);const params=[];let where='1=1';if(campaignId){where+=' AND (campaign_id=? OR campaign_id IS NULL)';params.push(campaignId)}const[r]=await pool.query(`SELECT p.*,(SELECT COUNT(*) FROM interview_results r WHERE r.phase_id=p.id) records FROM interview_phases p WHERE ${where} ORDER BY phase_order`,params);res.json(r)});
 app.post('/api/interview-phases',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const{name,phaseType='TASKPHASE',description='',campaignId}=req.body||{};if(!name)return res.status(400).json({error:'Phase name is required'});if(!['REC_INTERVIEW','TASKPHASE'].includes(phaseType))return res.status(400).json({error:'Invalid phase type'});const[[activeCampaign]]=await pool.query('SELECT id FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');const resolvedCampaignId=campaignId||activeCampaign?.id||null;const[[{nextOrder}]]=await pool.query('SELECT COALESCE(MAX(phase_order),0)+1 nextOrder FROM interview_phases WHERE campaign_id=?',[resolvedCampaignId]);const[r]=await pool.query('INSERT INTO interview_phases(campaign_id,name,phase_type,description,phase_order,active,created_by) VALUES(?,?,?,?,?,1,?)',[resolvedCampaignId,name,phaseType,description||null,nextOrder,req.user.id]);await audit({userId:req.user.id,action:'CREATE',objectType:'interview_phase',objectId:r.insertId,newValue:name});const[rows]=await pool.query('SELECT * FROM interview_phases WHERE id=?',[r.insertId]);res.status(201).json(rows[0])}catch(e){res.status(500).json({error:e.message})}});
@@ -130,25 +236,36 @@ app.get('/api/dashboard',requireAuth,async(_req,res)=>{
       WHERE ip.active=1 ${cid?'AND ip.campaign_id=?':''}
       GROUP BY ip.id ORDER BY ip.phase_order`,phaseParams);
     const [setAttendance]=await pool.query(`SELECT attendance,COUNT(*) count FROM candidates WHERE ${where} GROUP BY attendance`,params);
-    res.json({campaign:activeCampaign||null,stats:{applications:Number(s.applications||0),appeared:Number(s.appeared||0),absent:Number(s.absent||0),written_qualified:Number(s.written_qualified||0),written_rejected:Number(s.written_rejected||0),first_interview:Number(s.first_interview||0),taskphase:Number(s.taskphase||0),selected:Number(s.selected||0)},attendance:setAttendance,written:await writtenSummary(cid),phases});
+    const [branchStats]=await pool.query(`SELECT COALESCE(NULLIF(branch,''),'Unspecified') branch,COUNT(*) count FROM candidates WHERE ${where} GROUP BY COALESCE(NULLIF(branch,''),'Unspecified') ORDER BY count DESC LIMIT 8`,params);
+    res.json({campaign:activeCampaign||null,stats:{applications:Number(s.applications||0),appeared:Number(s.appeared||0),absent:Number(s.absent||0),unmarked:Number(s.applications||0)-Number(s.appeared||0)-Number(s.absent||0),written_qualified:Number(s.written_qualified||0),written_rejected:Number(s.written_rejected||0),first_interview:Number(s.first_interview||0),taskphase:Number(s.taskphase||0),selected:Number(s.selected||0)},attendance:setAttendance,branchStats,written:await writtenSummary(cid),phases});
   }catch(e){res.status(500).json({error:e.message})}
 });
 
 app.get('/api/needs-attention',requireAuth,async(_req,res)=>{
   try{
-    const [[a]]=await pool.query("SELECT COUNT(*) n FROM candidates WHERE deleted_at IS NULL AND status IN ('APPLIED FOR WRITTEN','GAVE WRITTEN')");
-    const [[b]]=await pool.query("SELECT COUNT(*) n FROM candidates c LEFT JOIN written_tests w ON w.candidate_id=c.id WHERE c.deleted_at IS NULL AND c.attendance='PRESENT' AND w.id IS NULL");
-    const [[c]]=await pool.query("SELECT COUNT(*) n FROM interview_results WHERE attendance='PRESENT' AND (remarks IS NULL OR remarks='')");
-    const [[d]]=await pool.query("SELECT COUNT(*) n FROM candidates WHERE deleted_at IS NULL AND status='ABSENT FOR WRITTEN'");
-    res.json({pendingWritten:Number(a.n||0),missingWrittenMarks:Number(b.n||0),interviewsMissingRemarks:Number(c.n||0),writtenAbsent:Number(d.n||0)});
+    const [[campaign]]=await pool.query('SELECT id FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');
+    const cid=campaign?.id||0;
+    const scope=cid?' AND campaign_id=?':''; const scopeParams=cid?[cid]:[];
+    const [[a]]=await pool.query("SELECT COUNT(*) n FROM candidates WHERE deleted_at IS NULL AND status IN ('APPLIED FOR WRITTEN','GAVE WRITTEN')"+scope,scopeParams);
+    const [[b]]=await pool.query("SELECT COUNT(*) n FROM candidates c LEFT JOIN written_tests w ON w.candidate_id=c.id WHERE c.deleted_at IS NULL AND c.attendance='PRESENT' AND w.id IS NULL"+(cid?' AND c.campaign_id=?':''),scopeParams);
+    const [[c]]=await pool.query("SELECT COUNT(*) n FROM interview_results WHERE attendance='PRESENT' AND (remarks IS NULL OR remarks='')",[]);
+    const [[d]]=await pool.query("SELECT COUNT(*) n FROM candidates WHERE deleted_at IS NULL AND status='ABSENT FOR WRITTEN'"+scope,scopeParams);
+    const [[u]]=await pool.query("SELECT COUNT(*) n FROM candidates WHERE deleted_at IS NULL AND attendance='UNKNOWN'"+scope,scopeParams);
+    res.json({pendingWritten:Number(a.n||0),missingWrittenMarks:Number(b.n||0),interviewsMissingRemarks:Number(c.n||0),writtenAbsent:Number(d.n||0),writtenUnmarked:Number(u.n||0)});
   }catch(e){res.status(500).json({error:e.message})}
 });
 
 app.get('/api/reports/candidates',requireAuth,async(req,res)=>{
   try{
-    const status=String(req.query.status||'').trim(); let sql='SELECT * FROM candidates WHERE deleted_at IS NULL'; const params=[];
-    if(status){sql+=' AND status=?';params.push(status)}
-    const[rows]=await pool.query(sql,params);res.json(rows);
+    const q=String(req.query.q||'').trim(),status=String(req.query.status||'').trim(),branch=String(req.query.branch||'').trim(),writtenAttendance=String(req.query.writtenAttendance||'').trim(),phaseId=Number(req.query.phaseId||0),includeDeleted=String(req.query.includeDeleted||'')==='true';
+    const params=[];let where=includeDeleted?'1=1':'deleted_at IS NULL';
+    if(q){where+=' AND (name LIKE ? OR learner_id LIKE ? OR registration_number LIKE ? OR phone LIKE ? OR email LIKE ? OR branch LIKE ?)';const like=`%${q}%`;params.push(like,like,like,like,like,like)}
+    if(status&&status!=='ALL'){where+=' AND status=?';params.push(status)}
+    if(branch){where+=' AND branch=?';params.push(branch)}
+    if(writtenAttendance==='PRESENT'||writtenAttendance==='ABSENT'){where+=' AND attendance=?';params.push(writtenAttendance)}
+    if(writtenAttendance==='UNMARKED'){where+=" AND attendance='UNKNOWN'"}
+    if(phaseId){where+=' AND EXISTS (SELECT 1 FROM interview_results fxr WHERE fxr.candidate_id=candidates.id AND fxr.phase_id=?)';params.push(phaseId)}
+    const[rows]=await pool.query(`SELECT * FROM candidates WHERE ${where} ORDER BY name`,params);res.json(rows);
   }catch(e){res.status(500).json({error:e.message})}
 });
 
