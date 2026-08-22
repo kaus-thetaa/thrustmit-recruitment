@@ -23,7 +23,7 @@
 For an existing local database, run:
 
 ```powershell
-cd "D:\Clubs and SPs\ThrustMIT\recruitment-system\recruitment-system\backend"
+cd "D:\Clubs and SPs\LMS\recruitment-system\recruitment-system\backend"
 npm run migrate
 ```
 

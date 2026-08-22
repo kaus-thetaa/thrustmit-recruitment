@@ -70,7 +70,7 @@ if (await hasColumn('interview_results', 'interviewer_names')) {
 }
 
 await pool.query(`INSERT INTO campaigns(name,recruitment_year,active,written_max_marks,written_qualified_count)
-  SELECT 'ThrustMIT Recruitment', YEAR(CURDATE()), 1, 20, 150
+  SELECT 'LMS Recruitment', YEAR(CURDATE()), 1, 20, 150
   WHERE NOT EXISTS (SELECT 1 FROM campaigns WHERE recruitment_year=YEAR(CURDATE()))`);
 
 const [[campaign]] = await pool.query('SELECT id FROM campaigns WHERE recruitment_year=YEAR(CURDATE()) ORDER BY id DESC LIMIT 1');

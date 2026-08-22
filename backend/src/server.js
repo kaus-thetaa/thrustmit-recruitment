@@ -6,7 +6,7 @@ import XLSX from 'xlsx';
 import { pool } from './db.js';
 import { requireAuth, requireRole, signToken, getUserById } from './auth.js';
 import { audit } from './audit.js';
-import { recalculateWrittenTests, writtenSummary, cutoffWhatIf, syncCandidateWorkflowStatus } from './services/writtenTestService.js';
+import { recalculateWrittenTests, writtenSummary, cutoffWhatIf, syncCandidateWorkflowStatus, METHOD_VERSION } from './services/writtenTestService.js';
 
 dotenv.config();
 const app=express();
@@ -15,18 +15,44 @@ app.use(cors({origin(origin,cb){if(!origin||allowedOrigins.includes('*')||allowe
 app.use(express.json({limit:'1mb'}));
 
 async function ensureV6Schema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS written_round_audits (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    campaign_id BIGINT UNSIGNED NOT NULL,
+    action ENUM('FINALIZE','REOPEN') NOT NULL,
+    method_version VARCHAR(120) NOT NULL,
+    target_count INT UNSIGNED NOT NULL,
+    scored_count INT UNSIGNED NOT NULL,
+    qualified_count INT UNSIGNED NOT NULL,
+    cutoff_percentile DECIMAL(10,6) NULL,
+    cutoff_set_percentile DECIMAL(10,6) NULL,
+    normalized_cutoff_percentile DECIMAL(10,6) NULL,
+    cutoff_marks DECIMAL(8,2) NULL,
+    cutoff_set TINYINT UNSIGNED NULL,
+    tie_at_cutoff BOOLEAN NOT NULL DEFAULT FALSE,
+    set_stats_json LONGTEXT NULL,
+    ranking_json LONGTEXT NULL,
+    reason TEXT NULL,
+    performed_by BIGINT UNSIGNED NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_wra_campaign_created (campaign_id, created_at),
+    CONSTRAINT fk_wra_campaign FOREIGN KEY (campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE,
+    CONSTRAINT fk_wra_user FOREIGN KEY (performed_by) REFERENCES users(id) ON DELETE SET NULL
+  ) ENGINE=InnoDB`);
   const checks=[
     ['campaigns','written_finalized','BOOLEAN NOT NULL DEFAULT FALSE'],
     ['campaigns','written_finalized_at','DATETIME NULL'],
     ['campaigns','written_finalized_by','BIGINT UNSIGNED NULL'],
+    ['written_round_audits','cutoff_set_percentile','DECIMAL(10,6) NULL'],
+    ['written_round_audits','normalized_cutoff_percentile','DECIMAL(10,6) NULL'],
   ];
   for(const [table,column,definition] of checks){
     const [rows]=await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=? LIMIT 1`,[table,column]);
     if(!rows.length) await pool.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
   }
-  // Do not mutate written finalization state automatically during startup.
-  // Existing recruitment data is preserved exactly as stored.
+  // Keep the visible title neutral; do not alter candidate/recruitment data.
+  await pool.query("UPDATE campaigns SET name='LMS Recruitment' WHERE name LIKE '%ThrustMIT%'");
 }
+
 
 const CANDIDATE_STATUSES=['ALL','APPLIED FOR WRITTEN','ABSENT FOR WRITTEN','GAVE WRITTEN','WRITTEN CLEARED','WRITTEN REJECTED','APPEARED FOR FIRST INTERVIEW','TASKPHASE','SELECTED','REJECTED','WITHDRAWN'];
 const ATTENDANCE=['PRESENT','ABSENT','RESCHEDULED','EXCUSED'];
@@ -170,25 +196,68 @@ app.post('/api/written/finalize',requireAuth,requireRole('ADMIN'),async(req,res)
   try{
     const[[campaign]]=await pool.query('SELECT * FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');
     if(!campaign)return res.status(404).json({error:'No active recruitment campaign'});
+    const reason=String(req.body?.reason||'Official written-round finalization').trim();
     const recalc=await recalculateWrittenTests(campaign.id);
-    if(Number(recalc.scored)<Number(campaign.written_qualified_count||150)) return res.status(400).json({error:`Need at least ${campaign.written_qualified_count||150} scored candidates before finalization. Currently ${recalc.scored}.`});
+    if(Number(recalc.scored)<Number(campaign.written_qualified_count||150)) return res.status(400).json({error:`Need at least ${campaign.written_qualified_count||150} valid written scores before finalization. Currently ${recalc.scored}.`});
+    if(recalc.qualificationMismatch) return res.status(409).json({error:'Written data is inconsistent. Resolve the data-health warning before finalization.'});
     await pool.query('UPDATE campaigns SET written_finalized=1,written_finalized_at=NOW(),written_finalized_by=? WHERE id=?',[req.user.id,campaign.id]);
     const final=await recalculateWrittenTests(campaign.id);
+    await pool.query(`INSERT INTO written_round_audits(campaign_id,action,method_version,target_count,scored_count,qualified_count,cutoff_percentile,cutoff_set_percentile,normalized_cutoff_percentile,cutoff_marks,cutoff_set,tie_at_cutoff,set_stats_json,ranking_json,reason,performed_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,[
+      campaign.id,'FINALIZE',METHOD_VERSION,Number(campaign.written_qualified_count||150),Number(final.scored||0),Number(final.qualified||0),final.cutoffPercentile,final.cutoffPercentile,final.normalizedCutoffPercentile,final.cutoffMarks,final.cutoffSet,final.tieAtCutoff?1:0,JSON.stringify(final.setStats||[]),JSON.stringify(final.ranking||[]),reason,req.user.id
+    ]);
+    await audit({userId:req.user.id,action:'FINALIZE_WRITTEN',objectType:'campaign',objectId:campaign.id,newValue:JSON.stringify({method:METHOD_VERSION,scored:final.scored,qualified:final.qualified,cutoffPercentile:final.cutoffPercentile,tieAtCutoff:final.tieAtCutoff,reason})});
     res.json({finalized:true,recalculation:final});
   }catch(e){res.status(500).json({error:e.message})}
 });
 app.post('/api/written/reopen',requireAuth,requireRole('ADMIN'),async(req,res)=>{
   try{
-    const[[campaign]]=await pool.query('SELECT id FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');
+    const[[campaign]]=await pool.query('SELECT * FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');
     if(!campaign)return res.status(404).json({error:'No active recruitment campaign'});
+    const reason=String(req.body?.reason||'Admin reopened written round for correction').trim();
+    const recalc=await recalculateWrittenTests(campaign.id);
     await pool.query('UPDATE campaigns SET written_finalized=0,written_finalized_at=NULL,written_finalized_by=NULL WHERE id=?',[campaign.id]);
-    await pool.query(`UPDATE written_tests w JOIN candidates c ON c.id=w.candidate_id SET w.qualified=NULL WHERE c.campaign_id=? AND c.deleted_at IS NULL`,[campaign.id]);
-    await pool.query(`UPDATE candidates SET status='GAVE WRITTEN' WHERE campaign_id=? AND deleted_at IS NULL AND status IN ('WRITTEN CLEARED','WRITTEN REJECTED') AND attendance='PRESENT'`,[campaign.id]);
-    await recalculateWrittenTests(campaign.id);
-    res.json({reopened:true});
+    // Preserve existing qualification values as PROVISIONAL history. They will be recomputed on refinalization.
+    await pool.query(`INSERT INTO written_round_audits(campaign_id,action,method_version,target_count,scored_count,qualified_count,cutoff_percentile,cutoff_set_percentile,normalized_cutoff_percentile,cutoff_marks,cutoff_set,tie_at_cutoff,set_stats_json,ranking_json,reason,performed_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,[
+      campaign.id,'REOPEN',METHOD_VERSION,Number(campaign.written_qualified_count||150),Number(recalc.scored||0),Number(recalc.qualified||0),recalc.cutoffPercentile,recalc.cutoffPercentile,recalc.normalizedCutoffPercentile,recalc.cutoffMarks,recalc.cutoffSet,recalc.tieAtCutoff?1:0,JSON.stringify(recalc.setStats||[]),JSON.stringify(recalc.ranking||[]),reason,req.user.id
+    ]);
+    await audit({userId:req.user.id,action:'REOPEN_WRITTEN',objectType:'campaign',objectId:campaign.id,newValue:reason});
+    res.json({reopened:true,message:'Written round reopened. Existing qualification is provisional until the round is finalized again.'});
   }catch(e){res.status(500).json({error:e.message})}
 });
-
+app.get('/api/written/audit',requireAuth,async(req,res)=>{
+  try{
+    let campaignId=Number(req.query.campaignId||0);
+    if(!campaignId){const[[c]]=await pool.query('SELECT id FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');campaignId=Number(c?.id||0)}
+    const [rows]=await pool.query(`SELECT a.id,a.action,a.method_version,a.target_count,a.scored_count,a.qualified_count,a.cutoff_percentile,a.cutoff_set_percentile,a.normalized_cutoff_percentile,a.cutoff_marks,a.cutoff_set,a.tie_at_cutoff,a.reason,a.created_at,u.name performed_by_name FROM written_round_audits a LEFT JOIN users u ON u.id=a.performed_by WHERE a.campaign_id=? ORDER BY a.created_at DESC LIMIT 20`,[campaignId]);
+    res.json(rows);
+  }catch(e){res.status(500).json({error:e.message})}
+});
+app.get('/api/written/audit/export',requireAuth,async(req,res)=>{
+  try{
+    let campaignId=Number(req.query.campaignId||0);
+    if(!campaignId){const[[c]]=await pool.query('SELECT id FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');campaignId=Number(c?.id||0)}
+    const [[campaign]]=await pool.query('SELECT id,name,recruitment_year,written_max_marks,written_qualified_count,written_finalized,written_finalized_at FROM campaigns WHERE id=?',[campaignId]);
+    if(!campaign)return res.status(404).json({error:'Campaign not found'});
+    const[[latest]]=await pool.query('SELECT * FROM written_round_audits WHERE campaign_id=? ORDER BY created_at DESC LIMIT 1',[campaignId]);
+    const auditRows=latest?.ranking_json?JSON.parse(latest.ranking_json):[];
+    const setStats=latest?.set_stats_json?JSON.parse(latest.set_stats_json):[];
+    const wb=XLSX.utils.book_new();
+    const summary=[
+      ['WRITTEN ROUND FAIRNESS AUDIT'],
+      ['Campaign',campaign.name],['Recruitment year',campaign.recruitment_year],['Method version',latest?.method_version||METHOD_VERSION],
+      ['Method','Set-wise midrank percentile; set z-score as secondary tie-break/audit signal; raw marks as tertiary tie-break; no candidate-ID tie-break.'],
+      ['Qualification rule',`Top ${Number(campaign.written_qualified_count||150)} scored candidates; complete ties at the cutoff are included.`],
+      ['Scored candidates',latest?.scored_count??auditRows.length],['Qualified candidates',latest?.qualified_count??auditRows.filter(r=>r.qualified).length],
+      ['Set percentile at cutoff',latest?.cutoff_set_percentile??latest?.cutoff_percentile??''],['Normalized percentile at cutoff',latest?.normalized_cutoff_percentile??''],['Cutoff marks',latest?.cutoff_marks??''],['Cutoff set',latest?.cutoff_set??''],['Tie at cutoff',latest?.tie_at_cutoff?'YES':'NO'],['Last action',latest?.action||'NOT FINALIZED'],['Performed by',latest?.performed_by||''],['Timestamp',latest?.created_at||''],['Reason',latest?.reason||''],[]
+    ];
+    const ws1=XLSX.utils.aoa_to_sheet(summary); ws1['!cols']=[{wch:28},{wch:105}]; XLSX.utils.book_append_sheet(wb,ws1,'Audit Summary');
+    const ss=[['Set','Candidates','Average marks','Median marks','SD','Min','Max'],...setStats.map(s=>[s.set_number,s.candidates,s.average,s.median,s.sd,s.min,s.max])];
+    const ws2=XLSX.utils.aoa_to_sheet(ss); ws2['!cols']=[{wch:8},{wch:14},{wch:18},{wch:16},{wch:14},{wch:12},{wch:12}]; XLSX.utils.book_append_sheet(wb,ws2,'Set Analysis');
+    const rr=[['Rank','Candidate ID','Set','Marks','Set Percentile','Z-score','Normalized Rank Percentile','Qualified'],...auditRows.map(r=>[r.rank,r.candidate_id,r.set_number,r.marks,r.set_percentile,r.normalized_z,r.normalized_percentile,r.qualified?'YES':'NO'])];
+    const ws3=XLSX.utils.aoa_to_sheet(rr); ws3['!autofilter']={ref:`A1:H${rr.length}`}; ws3['!freeze']={xSplit:0,ySplit:1}; ws3['!cols']=[{wch:8},{wch:14},{wch:8},{wch:10},{wch:18},{wch:12},{wch:26},{wch:12}]; XLSX.utils.book_append_sheet(wb,ws3,'Ranking Snapshot');
+    const out=XLSX.write(wb,{type:'buffer',bookType:'xlsx'}); res.setHeader('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); res.setHeader('Content-Disposition',`attachment; filename=written-fairness-audit-${campaign.recruitment_year}.xlsx`); res.send(out);
+  }catch(e){res.status(500).json({error:e.message})}
+});
 app.get('/api/written/summary',requireAuth,async(req,res)=>{try{res.json(await writtenSummary(req.query.campaignId?Number(req.query.campaignId):null))}catch(e){res.status(500).json({error:e.message})}});
 app.get('/api/written/what-if',requireAuth,async(req,res)=>{try{res.json(await cutoffWhatIf(req.query.topN,req.query.campaignId?Number(req.query.campaignId):null))}catch(e){res.status(500).json({error:e.message})}});
 app.get('/api/written/export',requireAuth,async(req,res)=>{
@@ -206,7 +275,7 @@ app.get('/api/written/export',requireAuth,async(req,res)=>{
       w.set_number,w.marks,w.set_percentile,w.normalized_percentile,w.normalized_z,w.qualified
       FROM candidates c JOIN written_tests w ON w.candidate_id=c.id
       WHERE ${scope}
-      ORDER BY w.normalized_percentile DESC,w.normalized_z DESC,c.name ASC`,params);
+      ORDER BY w.set_percentile DESC,w.normalized_z DESC,w.marks DESC,c.name ASC`,params);
     const qualified=rows.map((r,i)=>({...r,rank:i+1}));
     const cutoff=qualified.length?qualified[qualified.length-1]:null;
     const [setStats]=await pool.query(`SELECT w.set_number,COUNT(*) total,SUM(w.marks IS NOT NULL) scored,AVG(w.marks) avg_marks,MIN(w.marks) min_marks,MAX(w.marks) max_marks
@@ -331,7 +400,10 @@ app.get('/api/dashboard',requireAuth,async(_req,res)=>{
         SUM(w.qualified=1) qualified
       FROM written_tests w JOIN candidates cc ON cc.id=w.candidate_id
       WHERE cc.deleted_at IS NULL ${cid?'AND cc.campaign_id=?':''}`,cid?[cid]:[]);
-    res.json({campaign:activeCampaign||null,stats:{applications:Number(s.applications||0),appeared:Number(s.appeared||0),absent:Number(s.absent||0),unmarked:Number(s.applications||0)-Number(s.appeared||0)-Number(s.absent||0),written_qualified:Number(wCounts[0]?.qualified||0),written_rejected:Number(s.written_rejected||0),first_interview:Number(s.first_interview||0),taskphase:Number(s.taskphase||0),selected:Number(s.selected||0),written_scored:Number(wCounts[0]?.scored||0)},attendance:setAttendance,branchStats,written:await writtenSummary(cid),phases});
+    const [[latestAudit]]=await pool.query(`SELECT cutoff_percentile,cutoff_set_percentile,normalized_cutoff_percentile,cutoff_marks,cutoff_set,tie_at_cutoff,method_version,action,created_at FROM written_round_audits WHERE campaign_id=? ORDER BY created_at DESC LIMIT 1`,[cid||0]);
+    const summary=await writtenSummary(cid);
+    if(latestAudit){summary.cutoffPercentile=latestAudit.cutoff_set_percentile==null?summary.cutoffPercentile:Number(latestAudit.cutoff_set_percentile);summary.normalizedCutoffPercentile=latestAudit.normalized_cutoff_percentile==null?null:Number(latestAudit.normalized_cutoff_percentile);summary.cutoffMarks=latestAudit.cutoff_marks==null?null:Number(latestAudit.cutoff_marks);summary.cutoffSet=latestAudit.cutoff_set==null?null:Number(latestAudit.cutoff_set);summary.tieAtCutoff=Boolean(latestAudit.tie_at_cutoff);summary.auditMethod=latestAudit.method_version;summary.lastAuditAction=latestAudit.action;summary.lastAuditAt=latestAudit.created_at;}
+    res.json({campaign:activeCampaign||null,stats:{applications:Number(s.applications||0),appeared:Number(s.appeared||0),absent:Number(s.absent||0),unmarked:Number(s.applications||0)-Number(s.appeared||0)-Number(s.absent||0),written_qualified:Number(wCounts[0]?.qualified||0),written_rejected:Number(s.written_rejected||0),first_interview:Number(s.first_interview||0),taskphase:Number(s.taskphase||0),selected:Number(s.selected||0),written_scored:Number(wCounts[0]?.scored||0)},attendance:setAttendance,branchStats,written:summary,phases});
   }catch(e){res.status(500).json({error:e.message})}
 });
 

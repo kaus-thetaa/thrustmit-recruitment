@@ -29,3 +29,14 @@
 - No Excel re-import requirement.
 - Existing candidate/interview data is preserved.
 - Normal deployment flow remains `git add` → `git commit` → `git push`.
+
+## Final fairness hardening
+- Official written ranking now uses set-wise midrank percentile as the primary criterion.
+- Set z-score and raw marks are secondary tie-break signals only.
+- Candidate ID/database order is never used to break a performance tie.
+- Complete ties at the cutoff are all included rather than arbitrarily excluding one candidate.
+- Finalization and reopening now require an explicit Admin action and reason.
+- Reopening keeps old qualification as provisional history; refinalization recomputes it.
+- Finalization writes a persistent written-round audit snapshot.
+- Added dashboard written-round audit history and Excel audit export.
+- Added set-analysis statistics to the audit.
