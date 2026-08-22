@@ -107,12 +107,15 @@ export async function recalculateWrittenTests(campaignId = null) {
   const normalizedPct = z => midrankPercentile(sortedZ, z);
 
   let qualifiedCount = Number(process.env.WRITTEN_QUALIFIED_COUNT || 150);
+  let campaignFinalized = false;
   if (campaignId) {
-    const [[cfg]] = await pool.query('SELECT written_qualified_count FROM campaigns WHERE id=?', [campaignId]);
+    const [[cfg]] = await pool.query('SELECT written_qualified_count,written_finalized FROM campaigns WHERE id=?', [campaignId]);
     qualifiedCount = Number(cfg?.written_qualified_count || qualifiedCount);
+    campaignFinalized = Number(cfg?.written_finalized||0)===1;
   } else {
-    const [[cfg]] = await pool.query('SELECT written_qualified_count FROM campaigns WHERE active=1 ORDER BY id DESC LIMIT 1');
+    const [[cfg]] = await pool.query('SELECT written_qualified_count,written_finalized FROM campaigns WHERE active=1 ORDER BY id DESC LIMIT 1');
     qualifiedCount = Number(cfg?.written_qualified_count || qualifiedCount);
+    campaignFinalized = Number(cfg?.written_finalized||0)===1;
   }
 
   const ranked = [...scored].sort((a, b) =>
@@ -120,7 +123,7 @@ export async function recalculateWrittenTests(campaignId = null) {
     b.setPercentile - a.setPercentile ||
     a.candidate_id - b.candidate_id
   );
-  const finalized = ranked.length >= qualifiedCount;
+  const finalized = campaignFinalized;
   const qualifiedById = new Map();
   if (finalized) {
     for (let index = 0; index < ranked.length; index++) {
@@ -181,6 +184,7 @@ export async function recalculateWrittenTests(campaignId = null) {
     scored: ranked.length,
     qualified: finalized ? Math.min(qualifiedCount, ranked.length) : 0,
     finalized,
+    readyToFinalize: !finalized && ranked.length >= qualifiedCount,
     requiredForFinalization: qualifiedCount,
     cutoffZ: cutoff,
     cutoffPercentile: cutoff == null ? null : normalizedPct(cutoff)
