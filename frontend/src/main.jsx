@@ -26,6 +26,7 @@ function ThemeToggle(){
 }
 function ChartTheme(){const theme=useTheme();return theme==='dark'?{grid:'#2d333b',axis:'#aab4bf',bar:'#8ab4f8',bar2:'#6ea8fe',tooltip:'#171b20'}:{grid:'#e2e6ea',axis:'#68727e',bar:'#334155',bar2:'#4f6b95',tooltip:'#ffffff'};}
 function Stat({label,value,sub}){return <div className="stat"><span>{label}</span><b>{value??0}</b>{sub&&<small>{sub}</small>}</div>}
+function Info({label,value}){return <div className="info-card"><span>{label}</span><b>{value??'—'}</b></div>}
 function ErrorBox({message,onRetry}){return <div className="error-box"><b>Couldn’t load this section</b><span>{message}</span>{onRetry&&<button className="secondary" onClick={onRetry}>Retry</button>}</div>}
 function Loading({label='Loading…'}){return <div className="loading"><span className="spinner"/> {label}</div>}
 function Modal({title,onClose,children,wide=false}){return <div className="modal-backdrop" onMouseDown={e=>e.target===e.currentTarget&&onClose()}><div className={`modal ${wide?'modal-wide':''}`}><div className="modal-head"><div><div className="eyebrow">RECRUITMENT</div><h2>{title}</h2></div><button className="icon-btn" onClick={onClose}>×</button></div>{children}</div></div>}
