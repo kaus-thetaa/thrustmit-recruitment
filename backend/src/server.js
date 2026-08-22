@@ -24,15 +24,8 @@ async function ensureV6Schema(){
     const [rows]=await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=? LIMIT 1`,[table,column]);
     if(!rows.length) await pool.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
   }
-  // Preserve the current live recruitment state: if this campaign already has the
-  // configured number of qualified candidates, treat it as finalized instead of
-  // making everyone re-qualify after the code update.
-  const [[c]]=await pool.query(`SELECT id,written_qualified_count,written_finalized FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1`);
-  if(c && !Number(c.written_finalized)){
-    const [[q]]=await pool.query(`SELECT COUNT(*) n FROM written_tests w JOIN candidates c2 ON c2.id=w.candidate_id WHERE c2.campaign_id=? AND c2.deleted_at IS NULL AND w.qualified=1`,[c.id]);
-    if(Number(q.n||0)>=Number(c.written_qualified_count||150))
-      await pool.query(`UPDATE campaigns SET written_finalized=1, written_finalized_at=COALESCE(written_finalized_at,NOW()) WHERE id=?`,[c.id]);
-  }
+  // Do not mutate written finalization state automatically during startup.
+  // Existing recruitment data is preserved exactly as stored.
 }
 
 const CANDIDATE_STATUSES=['ALL','APPLIED FOR WRITTEN','ABSENT FOR WRITTEN','GAVE WRITTEN','WRITTEN CLEARED','WRITTEN REJECTED','APPEARED FOR FIRST INTERVIEW','TASKPHASE','SELECTED','REJECTED','WITHDRAWN'];
@@ -114,8 +107,12 @@ app.post('/api/written-tests/bulk-mark-absent',requireAuth,requireRole('ADMIN','
     const campaignIds=[...new Set(rows.map(r=>r.campaign_id).filter(Boolean))];
     const [[fin]] = campaignIds.length ? await pool.query(`SELECT COUNT(*) n FROM campaigns WHERE id IN (${campaignIds.map(()=>'?').join(',')}) AND written_finalized=1`,campaignIds) : [[{n:0}]];
     if(Number(fin.n||0)>0) return res.status(409).json({error:'Written round is finalized. Reopen it from the dashboard before changing attendance.'});
-    await pool.query(`UPDATE candidates SET attendance='ABSENT',status=CASE WHEN status IN ('APPLIED FOR WRITTEN','GAVE WRITTEN') THEN 'ABSENT FOR WRITTEN' ELSE status END WHERE deleted_at IS NULL AND attendance='UNKNOWN' AND id IN (${placeholders})`,ids);
-    for(const r of rows)await audit({userId:req.user.id,candidateId:r.id,action:'MARK_WRITTEN_ABSENT',objectType:'candidate',objectId:r.id,oldValue:'UNKNOWN',newValue:'ABSENT'});
+    await pool.query(`DELETE FROM written_tests WHERE candidate_id IN (${placeholders})`,ids);
+    await pool.query(`UPDATE candidates SET attendance='ABSENT' WHERE deleted_at IS NULL AND attendance='UNKNOWN' AND id IN (${placeholders})`,ids);
+    for(const r of rows){
+      await audit({userId:req.user.id,candidateId:r.id,action:'MARK_WRITTEN_ABSENT',objectType:'candidate',objectId:r.id,oldValue:'UNKNOWN',newValue:'ABSENT'});
+      await syncCandidateWorkflowStatus(r.id);
+    }
     for(const cid of campaignIds)await recalculateWrittenTests(cid);
     res.json({marked:rows.length});
   }catch(e){res.status(500).json({error:e.message})}
@@ -152,10 +149,14 @@ app.put('/api/written-tests/:candidateId/attendance',requireAuth,requireRole('AD
     const [[candidate]]=await pool.query('SELECT c.*,ca.written_finalized FROM candidates c LEFT JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=?',[req.params.candidateId]);
     if(!candidate) return res.status(404).json({error:'Candidate not found'});
     if(Number(candidate.written_finalized||0)===1) return res.status(409).json({error:'Written round is finalized. An admin must reopen it before changing attendance.'});
-    await pool.query('UPDATE candidates SET attendance=? WHERE id=?',[attendance,req.params.candidateId]);
     if(attendance==='ABSENT'){
-      await pool.query("UPDATE written_tests SET qualified=NULL,set_percentile=NULL,normalized_z=NULL,normalized_percentile=NULL WHERE candidate_id=?",[req.params.candidateId]);
+      const [[later]] = await pool.query('SELECT COUNT(*) n FROM interview_results WHERE candidate_id=?',[req.params.candidateId]);
+      if(Number(later.n||0)>0) return res.status(409).json({error:'This candidate already has interview history. Do not move them back to written absent without first correcting the later phase.'});
+      const [oldWritten]=await pool.query('SELECT id,set_number,marks,remarks,qualified,normalized_percentile FROM written_tests WHERE candidate_id=?',[req.params.candidateId]);
+      await pool.query('DELETE FROM written_tests WHERE candidate_id=?',[req.params.candidateId]);
+      if(oldWritten[0]) await audit({userId:req.user.id,candidateId:req.params.candidateId,action:'DELETE_WRITTEN_ON_ABSENCE',objectType:'written_test',objectId:oldWritten[0].id,oldValue:JSON.stringify(oldWritten[0]),newValue:'DELETED_BECAUSE_ATTENDANCE_SET_ABSENT'});
     }
+    await pool.query('UPDATE candidates SET attendance=? WHERE id=?',[attendance,req.params.candidateId]);
     if(attendance==='PRESENT' || attendance==='ABSENT') await recalculateWrittenTests(candidate.campaign_id);
     const status=await syncCandidateWorkflowStatus(req.params.candidateId);
     await audit({userId:req.user.id,candidateId:req.params.candidateId,action:'CHANGE_WRITTEN_ATTENDANCE',objectType:'candidate',objectId:req.params.candidateId,oldValue:candidate.attendance,newValue:attendance});
@@ -199,6 +200,8 @@ app.get('/api/written/export',requireAuth,async(req,res)=>{
     if(campaignId){scope+=' AND c.campaign_id=?';params.push(campaignId)}
     const [[campaign]]=await pool.query('SELECT id,name,recruitment_year,written_max_marks,written_qualified_count,written_finalized FROM campaigns WHERE id=? LIMIT 1',[campaignId||0]);
     if(campaign && !Number(campaign.written_finalized)) return res.status(409).json({error:'Written round is not finalized yet. Finalize it before downloading the official qualified sheet.'});
+    const [[integrity]]=await pool.query(`SELECT SUM(w.marks IS NOT NULL AND c.attendance='PRESENT') scored, SUM(w.qualified=1) qualified FROM written_tests w JOIN candidates c ON c.id=w.candidate_id WHERE c.deleted_at IS NULL ${campaignId?'AND c.campaign_id=?':''}`,campaignId?[campaignId]:[]);
+    if(Number(integrity?.qualified||0)>Number(integrity?.scored||0)) return res.status(409).json({error:`Written data needs reconciliation: ${Number(integrity.qualified||0)} qualified records but only ${Number(integrity.scored||0)} valid scores are present.`});
     const [rows]=await pool.query(`SELECT c.name,c.learner_id,c.registration_number,c.email,c.phone,c.branch,c.attendance,
       w.set_number,w.marks,w.set_percentile,w.normalized_percentile,w.normalized_z,w.qualified
       FROM candidates c JOIN written_tests w ON w.candidate_id=c.id
@@ -255,6 +258,7 @@ app.get('/api/written/export',requireAuth,async(req,res)=>{
 app.get('/api/interview-phases',requireAuth,async(req,res)=>{let campaignId=Number(req.query.campaignId||0);if(!campaignId){const[[c]]=await pool.query('SELECT id FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');campaignId=Number(c?.id||0)}const params=[];let where='1=1';if(campaignId){where+=' AND (campaign_id=? OR campaign_id IS NULL)';params.push(campaignId)}const[r]=await pool.query(`SELECT p.*,(SELECT COUNT(*) FROM interview_results r WHERE r.phase_id=p.id) records FROM interview_phases p WHERE ${where} ORDER BY phase_order`,params);res.json(r)});
 app.post('/api/interview-phases',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const{name,phaseType='TASKPHASE',description='',campaignId}=req.body||{};if(!name)return res.status(400).json({error:'Phase name is required'});if(!['REC_INTERVIEW','TASKPHASE'].includes(phaseType))return res.status(400).json({error:'Invalid phase type'});const[[activeCampaign]]=await pool.query('SELECT id FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');const resolvedCampaignId=campaignId||activeCampaign?.id||null;const[[{nextOrder}]]=await pool.query('SELECT COALESCE(MAX(phase_order),0)+1 nextOrder FROM interview_phases WHERE campaign_id=?',[resolvedCampaignId]);const[r]=await pool.query('INSERT INTO interview_phases(campaign_id,name,phase_type,description,phase_order,active,created_by) VALUES(?,?,?,?,?,1,?)',[resolvedCampaignId,name,phaseType,description||null,nextOrder,req.user.id]);await audit({userId:req.user.id,action:'CREATE',objectType:'interview_phase',objectId:r.insertId,newValue:name});const[rows]=await pool.query('SELECT * FROM interview_phases WHERE id=?',[r.insertId]);res.status(201).json(rows[0])}catch(e){res.status(500).json({error:e.message})}});
 app.put('/api/interview-phases/:id',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const{name,phaseType,description,active}=req.body||{};await pool.query('UPDATE interview_phases SET name=COALESCE(?,name),phase_type=COALESCE(?,phase_type),description=COALESCE(?,description),active=COALESCE(?,active) WHERE id=?',[name||null,phaseType||null,description??null,active==null?null:Boolean(active),req.params.id]);const[r]=await pool.query('SELECT * FROM interview_phases WHERE id=?',[req.params.id]);res.json(r[0])}catch(e){res.status(500).json({error:e.message})}});
+app.delete('/api/interview-phases/:id',requireAuth,requireRole('ADMIN'),async(req,res)=>{try{const[[phase]]=await pool.query('SELECT id,name FROM interview_phases WHERE id=?',[req.params.id]);if(!phase)return res.status(404).json({error:'Interview phase not found'});const[[cnt]]=await pool.query('SELECT COUNT(*) n FROM interview_results WHERE phase_id=?',[req.params.id]);if(Number(cnt.n||0)>0)return res.status(409).json({error:'This phase already has interview records. Archive/deactivate it instead of deleting it.'});await pool.query('DELETE FROM interview_phases WHERE id=?',[req.params.id]);await audit({userId:req.user.id,action:'DELETE',objectType:'interview_phase',objectId:req.params.id,oldValue:phase.name});res.json({deleted:true})}catch(e){res.status(500).json({error:e.message})}});
 
 app.get('/api/users/interviewers',requireAuth,async(_req,res)=>{const[r]=await pool.query("SELECT id,name,email,role FROM users WHERE active=1 AND role IN ('ADMIN','INTERVIEWER') ORDER BY name");res.json(r)});
 app.post('/api/interviews/:candidateId',requireAuth,requireRole('ADMIN','INTERVIEWER'),async(req,res)=>{
@@ -282,6 +286,24 @@ app.post('/api/interviews/:candidateId',requireAuth,requireRole('ADMIN','INTERVI
   }catch(e){res.status(500).json({error:e.code==='ER_DUP_ENTRY'?'This candidate already has a result for that phase.':e.message})}
 });
 
+app.get('/api/data-health',requireAuth,async(_req,res)=>{
+  try{
+    const [[campaign]]=await pool.query('SELECT id,written_qualified_count,written_finalized FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');
+    const cid=campaign?.id||0;
+    const p=cid?[cid]:[]; const scope=cid?' AND c.campaign_id=?':'';
+    const [[tot]]=await pool.query(`SELECT COUNT(*) total, SUM(attendance='PRESENT') present, SUM(attendance='ABSENT') absent, SUM(attendance='UNKNOWN') unmarked FROM candidates c WHERE c.deleted_at IS NULL${scope}`,p);
+    const [[marks]]=await pool.query(`SELECT COUNT(*) scored FROM written_tests w JOIN candidates c ON c.id=w.candidate_id WHERE c.deleted_at IS NULL AND c.attendance='PRESENT' AND w.marks IS NOT NULL${scope}`,p);
+    const [[allWritten]]=await pool.query(`SELECT COUNT(*) n FROM written_tests w JOIN candidates c ON c.id=w.candidate_id WHERE c.deleted_at IS NULL${scope}`,p);
+    const [[qualified]]=await pool.query(`SELECT COUNT(*) n FROM written_tests w JOIN candidates c ON c.id=w.candidate_id WHERE c.deleted_at IS NULL AND w.qualified=1${scope}`,p);
+    const [[qualifiedNoMarks]]=await pool.query(`SELECT COUNT(*) n FROM written_tests w JOIN candidates c ON c.id=w.candidate_id WHERE c.deleted_at IS NULL AND w.qualified=1 AND (w.marks IS NULL OR c.attendance<>'PRESENT')${scope}`,p);
+    const [[absentWithMarks]]=await pool.query(`SELECT COUNT(*) n FROM written_tests w JOIN candidates c ON c.id=w.candidate_id WHERE c.deleted_at IS NULL AND c.attendance='ABSENT'${scope}`,p);
+    const [[missingBranch]]=await pool.query(`SELECT COUNT(*) n FROM candidates c WHERE c.deleted_at IS NULL AND (c.branch IS NULL OR TRIM(c.branch)='')${scope}`,p);
+    const [dupes]=await pool.query(`SELECT registration_number,COUNT(*) n FROM candidates WHERE deleted_at IS NULL AND registration_number IS NOT NULL AND TRIM(registration_number)<>''${cid?' AND campaign_id=?':''} GROUP BY registration_number HAVING COUNT(*)>1 LIMIT 10`,cid?[cid]:[]);
+    const mismatch=Number(qualified.n||0)>Number(marks.scored||0);
+    res.json({campaignId:cid,total:Number(tot.total||0),present:Number(tot.present||0),absent:Number(tot.absent||0),unmarked:Number(tot.unmarked||0),marksEntered:Number(marks.scored||0),writtenRows:Number(allWritten.n||0),qualified:Number(qualified.n||0),qualifiedWithoutValidScore:Number(qualifiedNoMarks.n||0),absentWithWrittenData:Number(absentWithMarks.n||0),missingBranch:Number(missingBranch.n||0),duplicateRegistrations:dupes.length,duplicateExamples:dupes,qualificationMismatch:mismatch,finalized:Boolean(Number(campaign?.written_finalized||0)),required:Number(campaign?.written_qualified_count||150)});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
 app.get('/api/dashboard',requireAuth,async(_req,res)=>{
   try{
     const [[activeCampaign]]=await pool.query('SELECT id,name,recruitment_year,written_qualified_count,written_finalized,written_finalized_at FROM campaigns WHERE active=1 ORDER BY recruitment_year DESC,id DESC LIMIT 1');
@@ -289,7 +311,7 @@ app.get('/api/dashboard',requireAuth,async(_req,res)=>{
     const params=[]; let where='deleted_at IS NULL'; if(cid){where+=' AND campaign_id=?';params.push(cid)}
     const [[s]]=await pool.query(`SELECT COUNT(*) applications,
       SUM(attendance='PRESENT') appeared,SUM(attendance='ABSENT') absent,
-      SUM(status='WRITTEN CLEARED') written_qualified,SUM(status='SELECTED') selected,
+      SUM(status='SELECTED') selected,
       SUM(status='WRITTEN REJECTED') written_rejected,SUM(status='APPEARED FOR FIRST INTERVIEW') first_interview,
       SUM(status='TASKPHASE') taskphase FROM candidates WHERE ${where}`,params);
     const phaseParams=cid?[cid]:[];
@@ -304,8 +326,12 @@ app.get('/api/dashboard',requireAuth,async(_req,res)=>{
       GROUP BY ip.id ORDER BY ip.phase_order`,phaseParams);
     const [setAttendance]=await pool.query(`SELECT attendance,COUNT(*) count FROM candidates WHERE ${where} GROUP BY attendance`,params);
     const [branchStats]=await pool.query(`SELECT COALESCE(NULLIF(branch,''),'Unspecified') branch,COUNT(*) count FROM candidates WHERE ${where} GROUP BY COALESCE(NULLIF(branch,''),'Unspecified') ORDER BY count DESC LIMIT 8`,params);
-    const [wCounts]=await pool.query(`SELECT COUNT(*) scored FROM written_tests w JOIN candidates cc ON cc.id=w.candidate_id WHERE cc.deleted_at IS NULL ${cid?'AND cc.campaign_id=?':''} AND cc.attendance='PRESENT' AND w.marks IS NOT NULL`,cid?[cid]:[]);
-    res.json({campaign:activeCampaign||null,stats:{applications:Number(s.applications||0),appeared:Number(s.appeared||0),absent:Number(s.absent||0),unmarked:Number(s.applications||0)-Number(s.appeared||0)-Number(s.absent||0),written_qualified:Number(s.written_qualified||0),written_rejected:Number(s.written_rejected||0),first_interview:Number(s.first_interview||0),taskphase:Number(s.taskphase||0),selected:Number(s.selected||0),written_scored:Number(wCounts[0]?.scored||0)},attendance:setAttendance,branchStats,written:await writtenSummary(cid),phases});
+    const [wCounts]=await pool.query(`SELECT
+        SUM(cc.attendance='PRESENT' AND w.marks IS NOT NULL) scored,
+        SUM(w.qualified=1) qualified
+      FROM written_tests w JOIN candidates cc ON cc.id=w.candidate_id
+      WHERE cc.deleted_at IS NULL ${cid?'AND cc.campaign_id=?':''}`,cid?[cid]:[]);
+    res.json({campaign:activeCampaign||null,stats:{applications:Number(s.applications||0),appeared:Number(s.appeared||0),absent:Number(s.absent||0),unmarked:Number(s.applications||0)-Number(s.appeared||0)-Number(s.absent||0),written_qualified:Number(wCounts[0]?.qualified||0),written_rejected:Number(s.written_rejected||0),first_interview:Number(s.first_interview||0),taskphase:Number(s.taskphase||0),selected:Number(s.selected||0),written_scored:Number(wCounts[0]?.scored||0)},attendance:setAttendance,branchStats,written:await writtenSummary(cid),phases});
   }catch(e){res.status(500).json({error:e.message})}
 });
 

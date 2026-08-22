@@ -124,41 +124,60 @@ export async function recalculateWrittenTests(campaignId = null) {
     a.candidate_id - b.candidate_id
   );
   const finalized = campaignFinalized;
+  const enoughForFinalizedQualification = ranked.length >= qualifiedCount;
+  const qualificationMismatch = finalized && !enoughForFinalizedQualification;
   const qualifiedById = new Map();
-  if (finalized) {
+  if (finalized && enoughForFinalizedQualification) {
     for (let index = 0; index < ranked.length; index++) {
       qualifiedById.set(ranked[index].id, index < qualifiedCount);
     }
   }
 
   // Batch written-test updates into a single CASE statement.
+  // Never clear an existing qualification merely because the current scored pool
+  // is temporarily incomplete; that would make a late data-entry correction
+  // silently destroy an already-finalized result.
   if (scored.length) {
     const ids = scored.map(r => r.id);
     const setPctCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
     const zCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
     const normPctCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
-    const qualCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
     const updateParams = [];
 
     for (const row of scored) updateParams.push(row.id, row.setPercentile);
     for (const row of scored) updateParams.push(row.id, row.normalizedZ);
     for (const row of scored) updateParams.push(row.id, normalizedPct(row.normalizedZ));
-    for (const row of scored) updateParams.push(row.id, finalized ? (qualifiedById.get(row.id) ? 1 : 0) : null);
 
-    updateParams.push(...ids);
-    await pool.query(
-      `UPDATE written_tests
-          SET set_percentile=CASE ${setPctCase} END,
-              normalized_z=CASE ${zCase} END,
-              normalized_percentile=CASE ${normPctCase} END,
-              qualified=CASE ${qualCase} END
-        WHERE id IN (${ids.map(() => '?').join(',')})`,
-      updateParams
-    );
+    if (finalized && enoughForFinalizedQualification) {
+      const qualCase = ids.map(() => 'WHEN id=? THEN ?').join(' ');
+      for (const row of scored) updateParams.push(row.id, qualifiedById.get(row.id) ? 1 : 0);
+      updateParams.push(...ids);
+      await pool.query(
+        `UPDATE written_tests
+            SET set_percentile=CASE ${setPctCase} END,
+                normalized_z=CASE ${zCase} END,
+                normalized_percentile=CASE ${normPctCase} END,
+                qualified=CASE ${qualCase} END
+          WHERE id IN (${ids.map(() => '?').join(',')})`,
+        updateParams
+      );
+    } else {
+      // Keep existing qualified values intact until the round has a complete
+      // qualification pool, while refreshing the percentile calculations.
+      updateParams.push(...ids);
+      await pool.query(
+        `UPDATE written_tests
+            SET set_percentile=CASE ${setPctCase} END,
+                normalized_z=CASE ${zCase} END,
+                normalized_percentile=CASE ${normPctCase} END
+          WHERE id IN (${ids.map(() => '?').join(',')})`,
+        updateParams
+      );
+    }
   }
 
   // Keep candidate workflow statuses consistent in one database operation.
-  if (scored.length) {
+  if (scored.length && !qualificationMismatch) {
     const ids = [...new Set(scored.map(r => r.candidate_id))];
     const candidatePlaceholders = ids.map(() => '?').join(',');
     await pool.query(
@@ -179,11 +198,17 @@ export async function recalculateWrittenTests(campaignId = null) {
     );
   }
 
-  const cutoff = finalized && ranked.length ? ranked[Math.min(qualifiedCount, ranked.length) - 1].normalizedZ : null;
+  let existingQualified = 0;
+  if (finalized) {
+    const [qRows] = await pool.query(`SELECT COUNT(*) qualified FROM written_tests w JOIN candidates c ON c.id=w.candidate_id WHERE w.qualified=1 AND c.deleted_at IS NULL${campaignId ? ' AND c.campaign_id=?' : ''}`, campaignId ? [campaignId] : []);
+    existingQualified = Number(qRows[0]?.qualified || 0);
+  }
+  const cutoff = finalized && enoughForFinalizedQualification ? ranked[qualifiedCount - 1].normalizedZ : null;
   return {
     scored: ranked.length,
-    qualified: finalized ? Math.min(qualifiedCount, ranked.length) : 0,
+    qualified: finalized ? (qualificationMismatch ? existingQualified : Math.min(qualifiedCount, ranked.length)) : 0,
     finalized,
+    qualificationMismatch,
     readyToFinalize: !finalized && ranked.length >= qualifiedCount,
     requiredForFinalization: qualifiedCount,
     cutoffZ: cutoff,
@@ -215,6 +240,14 @@ export async function writtenSummary(campaignId = null) {
       WHERE ${where} AND w.qualified=1`,
     params
   );
+  const [[counts]] = await pool.query(
+    `SELECT
+       SUM(w.marks IS NOT NULL AND c.attendance='PRESENT') scored_count,
+       SUM(w.qualified=1) qualified_count
+       FROM written_tests w
+       JOIN candidates c ON c.id=w.candidate_id
+      WHERE ${where}`, params
+  );
 
   const [scores] = await pool.query(
     `SELECT w.set_number,w.marks,w.normalized_percentile,w.qualified
@@ -231,9 +264,14 @@ export async function writtenSummary(campaignId = null) {
     r.max_marks = r.max_marks == null ? null : Number(r.max_marks);
   }
 
+  const scoredCount=Number(counts?.scored_count||0);
+  const qualifiedCount=Number(counts?.qualified_count||0);
   return {
     sets: rows,
-    cutoffPercentile: cut?.cutoff_percentile == null ? null : Number(cut.cutoff_percentile),
+    scoredCount,
+    qualifiedCount,
+    qualificationMismatch: qualifiedCount>scoredCount,
+    cutoffPercentile: qualifiedCount>scoredCount ? null : (cut?.cutoff_percentile == null ? null : Number(cut.cutoff_percentile)),
     scores
   };
 }
